@@ -1,19 +1,20 @@
+import re
 from ast import literal_eval
 from operator import attrgetter
-import re
 from typing import Callable, Iterable, List, Match, NamedTuple, Optional, Tuple, Union
 
+from ._emoji_replace import _emoji_replace
+from .emoji import EmojiVariant
 from .errors import MarkupError
 from .style import Style
 from .text import Span, Text
-from .emoji import EmojiVariant
-from ._emoji_replace import _emoji_replace
-
 
 RE_TAGS = re.compile(
-    r"""((\\*)\[([a-z#\/@].*?)\])""",
+    r"""((\\*)\[([a-z#/@][^[]*?)])""",
     re.VERBOSE,
 )
+
+RE_HANDLER = re.compile(r"^([\w.]*?)(\(.*?\))?$")
 
 
 class Tag(NamedTuple):
@@ -45,7 +46,8 @@ _EscapeSubMethod = Callable[[_ReSubCallable, str], str]  # Sub method of a compi
 
 
 def escape(
-    markup: str, _escape: _EscapeSubMethod = re.compile(r"(\\*)(\[[a-z#\/].*?\])").sub
+    markup: str,
+    _escape: _EscapeSubMethod = re.compile(r"(\\*)(\[[a-z#/@][^[]*?])").sub,
 ) -> str:
     """Escapes text so that it won't be interpreted as markup.
 
@@ -62,6 +64,9 @@ def escape(
         return f"{backslashes}{backslashes}\\{text}"
 
     markup = _escape(escape_backslashes, markup)
+    if markup.endswith("\\") and not markup.endswith("\\\\"):
+        return markup + "\\"
+
     return markup
 
 
@@ -108,7 +113,10 @@ def render(
 
     Args:
         markup (str): A string containing console markup.
+        style: (Union[str, Style]): The style to use.
         emoji (bool, optional): Also render emoji code. Defaults to True.
+        emoji_variant (str, optional): Optional emoji variant, either "text" or "emoji". Defaults to None.
+
 
     Raises:
         MarkupError: If there is a syntax error in the markup.
@@ -144,6 +152,8 @@ def render(
 
     for position, plain_text, tag in _parse(markup):
         if plain_text is not None:
+            # Handle open brace escapes, where the brace is not part of a tag.
+            plain_text = plain_text.replace("\\[", "[")
             append(emoji_replace(plain_text) if emoji else plain_text)
         elif tag is not None:
             if tag.name.startswith("/"):  # Closing tag
@@ -167,16 +177,33 @@ def render(
 
                 if open_tag.name.startswith("@"):
                     if open_tag.parameters:
+                        handler_name = ""
+                        parameters = open_tag.parameters.strip()
+                        handler_match = RE_HANDLER.match(parameters)
+                        if handler_match is not None:
+                            handler_name, match_parameters = handler_match.groups()
+                            parameters = (
+                                "()" if match_parameters is None else match_parameters
+                            )
+
                         try:
-                            meta_params = literal_eval(open_tag.parameters)
+                            meta_params = literal_eval(parameters)
                         except SyntaxError as error:
                             raise MarkupError(
-                                f"error parsing {open_tag.parameters!r}; {error.msg}"
+                                f"error parsing {parameters!r} in {open_tag.parameters!r}; {error.msg}"
                             )
                         except Exception as error:
                             raise MarkupError(
                                 f"error parsing {open_tag.parameters!r}; {error}"
                             ) from None
+
+                        if handler_name:
+                            meta_params = (
+                                handler_name,
+                                meta_params
+                                if isinstance(meta_params, tuple)
+                                else (meta_params,),
+                            )
 
                     else:
                         meta_params = ()
@@ -205,23 +232,20 @@ def render(
 
 
 if __name__ == "__main__":  # pragma: no cover
-
-    from rich.console import Console
-    from rich.text import Text
-
-    console = Console(highlight=True)
-
-    t = render("[b]Hello[/b] [@click='view.toggle', 'left']World[/]")
-    console.print(t)
-    console.print(t._spans)
-
-    console.print("Hello [1], [1,2,3] ['hello']")
-    console.print("foo")
-    console.print("Hello [link=https://www.willmcgugan.com]W[b red]o[/]rld[/]!")
+    MARKUP = [
+        "[red]Hello World[/red]",
+        "[magenta]Hello [b]World[/b]",
+        "[bold]Bold[italic] bold and italic [/bold]italic[/italic]",
+        "Click [link=https://www.willmcgugan.com]here[/link] to visit my Blog",
+        ":warning-emoji: [bold red blink] DANGER![/]",
+    ]
 
     from rich import print
+    from rich.table import Table
 
-    print(escape("[red]"))
-    print(escape(r"\[red]"))
-    print(escape(r"\\[red]"))
-    print(escape(r"\\\[red]"))
+    grid = Table("Markup", "Result", padding=(0, 1))
+
+    for markup in MARKUP:
+        grid.add_row(Text(markup), markup)
+
+    print(grid)

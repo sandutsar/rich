@@ -1,19 +1,19 @@
 import inspect
 import os
-import platform
-import shutil
 import sys
 import threading
+import zlib
 from abc import ABC, abstractmethod
-from collections import abc
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import wraps
 from getpass import getpass
-from itertools import islice
-from time import monotonic
-from types import FrameType, TracebackType
+from html import escape
 from inspect import isclass
+from itertools import islice
+from math import ceil
+from time import monotonic
+from types import FrameType, ModuleType, TracebackType
 from typing import (
     IO,
     TYPE_CHECKING,
@@ -28,11 +28,11 @@ from typing import (
     TextIO,
     Tuple,
     Type,
-    Tuple,
     Union,
     cast,
 )
 
+from rich._null_file import NULL_FILE
 
 if sys.version_info >= (3, 8):
     from typing import Literal, Protocol, runtime_checkable
@@ -43,12 +43,13 @@ else:
         runtime_checkable,
     )  # pragma: no cover
 
-
 from . import errors, themes
 from ._emoji_replace import _emoji_replace
+from ._export_format import CONSOLE_HTML_FORMAT, CONSOLE_SVG_FORMAT
+from ._fileno import get_fileno
 from ._log_render import FormatTimeCallable, LogRender
 from .align import Align, AlignMethod
-from .color import ColorSystem
+from .color import ColorSystem, blend_rgb
 from .control import Control
 from .emoji import EmojiVariant
 from .highlighter import NullHighlighter, ReprHighlighter
@@ -56,13 +57,14 @@ from .markup import render as render_markup
 from .measure import Measurement, measure_renderables
 from .pager import Pager, SystemPager
 from .pretty import Pretty, is_expandable
+from .protocol import rich_cast
 from .region import Region
 from .scope import render_scope
 from .screen import Screen
 from .segment import Segment
 from .style import Style, StyleType
 from .styled import Styled
-from .terminal_theme import DEFAULT_TERMINAL_THEME, TerminalTheme
+from .terminal_theme import DEFAULT_TERMINAL_THEME, SVG_EXPORT_THEME, TerminalTheme
 from .text import Text, TextType
 from .theme import Theme, ThemeStack
 
@@ -71,7 +73,9 @@ if TYPE_CHECKING:
     from .live import Live
     from .status import Status
 
-WINDOWS = platform.system() == "Windows"
+JUPYTER_DEFAULT_COLUMNS = 115
+JUPYTER_DEFAULT_LINES = 100
+WINDOWS = sys.platform == "win32"
 
 HighlighterType = Callable[[Union[str, "Text"]], "Text"]
 JustifyMethod = Literal["default", "left", "center", "right", "full"]
@@ -84,29 +88,28 @@ class NoChange:
 
 NO_CHANGE = NoChange()
 
+try:
+    _STDIN_FILENO = sys.__stdin__.fileno()  # type: ignore[union-attr]
+except Exception:
+    _STDIN_FILENO = 0
+try:
+    _STDOUT_FILENO = sys.__stdout__.fileno()  # type: ignore[union-attr]
+except Exception:
+    _STDOUT_FILENO = 1
+try:
+    _STDERR_FILENO = sys.__stderr__.fileno()  # type: ignore[union-attr]
+except Exception:
+    _STDERR_FILENO = 2
 
-CONSOLE_HTML_FORMAT = """\
-<!DOCTYPE html>
-<head>
-<meta charset="UTF-8">
-<style>
-{stylesheet}
-body {{
-    color: {foreground};
-    background-color: {background};
-}}
-</style>
-</head>
-<html>
-<body>
-    <code>
-        <pre style="font-family:Menlo,'DejaVu Sans Mono',consolas,'Courier New',monospace">{code}</pre>
-    </code>
-</body>
-</html>
-"""
+_STD_STREAMS = (_STDIN_FILENO, _STDOUT_FILENO, _STDERR_FILENO)
+_STD_STREAMS_OUTPUT = (_STDOUT_FILENO, _STDERR_FILENO)
 
-_TERM_COLORS = {"256color": ColorSystem.EIGHT_BIT, "16color": ColorSystem.STANDARD}
+
+_TERM_COLORS = {
+    "kitty": ColorSystem.EIGHT_BIT,
+    "256color": ColorSystem.EIGHT_BIT,
+    "16color": ColorSystem.STANDARD,
+}
 
 
 class ConsoleDimensions(NamedTuple):
@@ -213,6 +216,29 @@ class ConsoleOptions:
         options.min_width = options.max_width = max(0, width)
         return options
 
+    def update_height(self, height: int) -> "ConsoleOptions":
+        """Update the height, and return a copy.
+
+        Args:
+            height (int): New height
+
+        Returns:
+            ~ConsoleOptions: New Console options instance.
+        """
+        options = self.copy()
+        options.max_height = options.height = height
+        return options
+
+    def reset_height(self) -> "ConsoleOptions":
+        """Return a copy of the options with height set to ``None``.
+
+        Returns:
+            ~ConsoleOptions: New console options instance.
+        """
+        options = self.copy()
+        options.height = None
+        return options
+
     def update_dimensions(self, width: int, height: int) -> "ConsoleOptions":
         """Update the width and height, and return a copy.
 
@@ -225,8 +251,7 @@ class ConsoleOptions:
         """
         options = self.copy()
         options.min_width = options.max_width = max(0, width)
-        options.height = height
-        options.max_height = height
+        options.height = options.max_height = height
         return options
 
 
@@ -234,7 +259,9 @@ class ConsoleOptions:
 class RichCast(Protocol):
     """An object that may be 'cast' to a console renderable."""
 
-    def __rich__(self) -> Union["ConsoleRenderable", str]:  # pragma: no cover
+    def __rich__(
+        self,
+    ) -> Union["ConsoleRenderable", "RichCast", str]:  # pragma: no cover
         ...
 
 
@@ -248,12 +275,12 @@ class ConsoleRenderable(Protocol):
         ...
 
 
+# A type that may be rendered by Console.
 RenderableType = Union[ConsoleRenderable, RichCast, str]
-"""A type that may be rendered by Console."""
+"""A string or any object that may be rendered by Rich."""
 
+# The result of calling a __rich_console__ method.
 RenderResult = Iterable[Union[RenderableType, Segment]]
-"""The result of calling a __rich_console__ method."""
-
 
 _null_highlighter = NullHighlighter()
 
@@ -408,7 +435,7 @@ class ScreenContext:
         """
         if renderables:
             self.screen.renderable = (
-                RenderGroup(*renderables) if len(renderables) > 1 else renderables[0]
+                Group(*renderables) if len(renderables) > 1 else renderables[0]
             )
         if style is not None:
             self.screen.style = style
@@ -432,7 +459,7 @@ class ScreenContext:
                 self.console.show_cursor(True)
 
 
-class RenderGroup:
+class Group:
     """Takes a group of renderables and returns a renderable object that renders the group.
 
     Args:
@@ -465,7 +492,7 @@ class RenderGroup:
         yield from self.renderables
 
 
-def render_group(fit: bool = True) -> Callable[..., Callable[..., RenderGroup]]:
+def group(fit: bool = True) -> Callable[..., Callable[..., Group]]:
     """A decorator that turns an iterable of renderables in to a group.
 
     Args:
@@ -474,13 +501,13 @@ def render_group(fit: bool = True) -> Callable[..., Callable[..., RenderGroup]]:
 
     def decorator(
         method: Callable[..., Iterable[RenderableType]]
-    ) -> Callable[..., RenderGroup]:
-        """Convert a method that returns an iterable of renderables in to a RenderGroup."""
+    ) -> Callable[..., Group]:
+        """Convert a method that returns an iterable of renderables in to a Group."""
 
         @wraps(method)
-        def _replace(*args: Any, **kwargs: Any) -> RenderGroup:
+        def _replace(*args: Any, **kwargs: Any) -> Group:
             renderables = method(*args, **kwargs)
-            return RenderGroup(*renderables, fit=fit)
+            return Group(*renderables, fit=fit)
 
         return _replace
 
@@ -490,12 +517,16 @@ def render_group(fit: bool = True) -> Callable[..., Callable[..., RenderGroup]]:
 def _is_jupyter() -> bool:  # pragma: no cover
     """Check if we're running in a Jupyter notebook."""
     try:
-        get_ipython  # type: ignore
+        get_ipython  # type: ignore[name-defined]
     except NameError:
         return False
-    ipython = get_ipython()  # type: ignore
+    ipython = get_ipython()  # type: ignore[name-defined]
     shell = ipython.__class__.__name__
-    if "google.colab" in str(ipython.__class__) or shell == "ZMQInteractiveShell":
+    if (
+        "google.colab" in str(ipython.__class__)
+        or os.getenv("DATABRICKS_RUNTIME_VERSION")
+        or shell == "ZMQInteractiveShell"
+    ):
         return True  # Jupyter notebook or qtconsole
     elif shell == "TerminalInteractiveShell":
         return False  # Terminal running IPython
@@ -509,7 +540,6 @@ COLOR_SYSTEMS = {
     "truecolor": ColorSystem.TRUECOLOR,
     "windows": ColorSystem.WINDOWS,
 }
-
 
 _COLOR_SYSTEMS_NAMES = {system: name for name, system in COLOR_SYSTEMS.items()}
 
@@ -560,12 +590,6 @@ def detect_legacy_windows() -> bool:
     return WINDOWS and not get_windows_console_features().vt
 
 
-if detect_legacy_windows():  # pragma: no cover
-    from colorama import init
-
-    init(strip=False)
-
-
 class Console:
     """A high level console interface.
 
@@ -586,7 +610,7 @@ class Console:
         no_color (Optional[bool], optional): Enabled no color mode, or None to auto detect. Defaults to None.
         tab_size (int, optional): Number of spaces used to replace a tab character. Defaults to 8.
         record (bool, optional): Boolean to enable recording of terminal output,
-            required to call :meth:`export_html` and :meth:`export_text`. Defaults to False.
+            required to call :meth:`export_html`, :meth:`export_svg`, and :meth:`export_text`. Defaults to False.
         markup (bool, optional): Boolean to enable :ref:`console_markup`. Defaults to True.
         emoji (bool, optional): Enable emoji code. Defaults to True.
         emoji_variant (str, optional): Optional emoji variant, either "text" or "emoji". Defaults to None.
@@ -644,13 +668,35 @@ class Console:
 
         self.is_jupyter = _is_jupyter() if force_jupyter is None else force_jupyter
         if self.is_jupyter:
-            width = width or 93
-            height = height or 100
+            if width is None:
+                jupyter_columns = self._environ.get("JUPYTER_COLUMNS")
+                if jupyter_columns is not None and jupyter_columns.isdigit():
+                    width = int(jupyter_columns)
+                else:
+                    width = JUPYTER_DEFAULT_COLUMNS
+            if height is None:
+                jupyter_lines = self._environ.get("JUPYTER_LINES")
+                if jupyter_lines is not None and jupyter_lines.isdigit():
+                    height = int(jupyter_lines)
+                else:
+                    height = JUPYTER_DEFAULT_LINES
+
+        self.tab_size = tab_size
+        self.record = record
+        self._markup = markup
+        self._emoji = emoji
+        self._emoji_variant: Optional[EmojiVariant] = emoji_variant
+        self._highlight = highlight
+        self.legacy_windows: bool = (
+            (detect_legacy_windows() and not self.is_jupyter)
+            if legacy_windows is None
+            else legacy_windows
+        )
 
         if width is None:
             columns = self._environ.get("COLUMNS")
             if columns is not None and columns.isdigit():
-                width = int(columns)
+                width = int(columns) - self.legacy_windows
         if height is None:
             lines = self._environ.get("LINES")
             if lines is not None and lines.isdigit():
@@ -659,20 +705,13 @@ class Console:
         self.soft_wrap = soft_wrap
         self._width = width
         self._height = height
-        self.tab_size = tab_size
-        self.record = record
-        self._markup = markup
-        self._emoji = emoji
-        self._emoji_variant = emoji_variant
-        self._highlight = highlight
-        self.legacy_windows: bool = (
-            (detect_legacy_windows() and not self.is_jupyter)
-            if legacy_windows is None
-            else legacy_windows
-        )
 
         self._color_system: Optional[ColorSystem]
-        self._force_terminal = force_terminal
+
+        self._force_terminal = None
+        if force_terminal is not None:
+            self._force_terminal = force_terminal
+
         self._file = file
         self.quiet = quiet
         self.stderr = stderr
@@ -714,13 +753,15 @@ class Console:
         self._is_alt_screen = False
 
     def __repr__(self) -> str:
-        return f"<console width={self.width} {str(self._color_system)}>"
+        return f"<console width={self.width} {self._color_system!s}>"
 
     @property
     def file(self) -> IO[str]:
         """Get the file object to write to."""
         file = self._file or (sys.stderr if self.stderr else sys.stdout)
         file = getattr(file, "rich_proxied_file", file)
+        if file is None:
+            file = NULL_FILE
         return file
 
     @file.setter
@@ -767,7 +808,7 @@ class Console:
             if color_term in ("truecolor", "24bit"):
                 return ColorSystem.TRUECOLOR
             term = self._environ.get("TERM", "").strip().lower()
-            _term_name, _hyphen, colors = term.partition("-")
+            _term_name, _hyphen, colors = term.rpartition("-")
             color_system = _TERM_COLORS.get(colors, ColorSystem.STANDARD)
             return color_system
 
@@ -805,12 +846,13 @@ class Console:
         Args:
             hook (RenderHook): Render hook instance.
         """
-
-        self._render_hooks.append(hook)
+        with self._lock:
+            self._render_hooks.append(hook)
 
     def pop_render_hook(self) -> None:
         """Pop the last renderhook from the stack."""
-        self._render_hooks.pop()
+        with self._lock:
+            self._render_hooks.pop()
 
     def __enter__(self) -> "Console":
         """Own context manager to enter buffer context."""
@@ -895,8 +937,31 @@ class Console:
         """
         if self._force_terminal is not None:
             return self._force_terminal
+
+        if hasattr(sys.stdin, "__module__") and sys.stdin.__module__.startswith(
+            "idlelib"
+        ):
+            # Return False for Idle which claims to be a tty but can't handle ansi codes
+            return False
+
+        if self.is_jupyter:
+            # return False for Jupyter, which may have FORCE_COLOR set
+            return False
+
+        # If FORCE_COLOR env var has any value at all, we assume a terminal.
+        force_color = self._environ.get("FORCE_COLOR")
+        if force_color is not None:
+            self._force_terminal = True
+            return True
+
         isatty: Optional[Callable[[], bool]] = getattr(self.file, "isatty", None)
-        return False if isatty is None else isatty()
+        try:
+            return False if isatty is None else isatty()
+        except ValueError:
+            # in some situation (at the end of a pytest run for example) isatty() can raise
+            # ValueError: I/O operation on closed file
+            # return False because we aren't in a terminal anymore
+            return False
 
     @property
     def is_dumb_terminal(self) -> bool:
@@ -932,29 +997,35 @@ class Console:
         """
 
         if self._width is not None and self._height is not None:
-            return ConsoleDimensions(self._width, self._height)
+            return ConsoleDimensions(self._width - self.legacy_windows, self._height)
 
         if self.is_dumb_terminal:
             return ConsoleDimensions(80, 25)
 
         width: Optional[int] = None
         height: Optional[int] = None
-        if WINDOWS:  # pragma: no cover
-            width, height = shutil.get_terminal_size()
-        else:
+
+        streams = _STD_STREAMS_OUTPUT if WINDOWS else _STD_STREAMS
+        for file_descriptor in streams:
             try:
-                width, height = os.get_terminal_size(sys.__stdin__.fileno())
-            except (AttributeError, ValueError, OSError):
-                try:
-                    width, height = os.get_terminal_size(sys.__stdout__.fileno())
-                except (AttributeError, ValueError, OSError):
-                    pass
+                width, height = os.get_terminal_size(file_descriptor)
+            except (AttributeError, ValueError, OSError):  # Probably not a terminal
+                pass
+            else:
+                break
+
+        columns = self._environ.get("COLUMNS")
+        if columns is not None and columns.isdigit():
+            width = int(columns)
+        lines = self._environ.get("LINES")
+        if lines is not None and lines.isdigit():
+            height = int(lines)
 
         # get_terminal_size can report 0, 0 if run from pseudo-terminal
         width = width or 80
         height = height or 25
         return ConsoleDimensions(
-            (width - self.legacy_windows) if self._width is None else self._width,
+            width - self.legacy_windows if self._width is None else self._width,
             height if self._height is None else self._height,
         )
 
@@ -1033,7 +1104,7 @@ class Console:
         is defined by the system and will typically support at least pressing a key to scroll.
 
         Args:
-            pager (Pager, optional): A pager object, or None to use :class:~rich.pager.SystemPager`. Defaults to None.
+            pager (Pager, optional): A pager object, or None to use :class:`~rich.pager.SystemPager`. Defaults to None.
             styles (bool, optional): Show styles in pager. Defaults to False.
             links (bool, optional): Show links in pager. Defaults to False.
 
@@ -1075,7 +1146,7 @@ class Console:
         status: RenderableType,
         *,
         spinner: str = "dots",
-        spinner_style: str = "status.spinner",
+        spinner_style: StyleType = "status.spinner",
         speed: float = 1.0,
         refresh_per_second: float = 12.5,
     ) -> "Status":
@@ -1083,7 +1154,6 @@ class Console:
 
         Args:
             status (RenderableType): A status renderable (str or Text typically).
-            console (Console, optional): Console instance to use, or None for global console. Defaults to None.
             spinner (str, optional): Name of spinner animation (see python -m rich.spinner). Defaults to "dots".
             spinner_style (StyleType, optional): Style of spinner. Defaults to "status.spinner".
             speed (float, optional): Speed factor for spinner animation. Defaults to 1.0.
@@ -1110,7 +1180,7 @@ class Console:
         Args:
             show (bool, optional): Set visibility of the cursor.
         """
-        if self.is_terminal and not self.legacy_windows:
+        if self.is_terminal:
             self.control(Control.show_cursor(show))
             return True
         return False
@@ -1144,6 +1214,38 @@ class Console:
             bool: True if the alt screen was enabled, otherwise False.
         """
         return self._is_alt_screen
+
+    def set_window_title(self, title: str) -> bool:
+        """Set the title of the console terminal window.
+
+        Warning: There is no means within Rich of "resetting" the window title to its
+        previous value, meaning the title you set will persist even after your application
+        exits.
+
+        ``fish`` shell resets the window title before and after each command by default,
+        negating this issue. Windows Terminal and command prompt will also reset the title for you.
+        Most other shells and terminals, however, do not do this.
+
+        Some terminals may require configuration changes before you can set the title.
+        Some terminals may not support setting the title at all.
+
+        Other software (including the terminal itself, the shell, custom prompts, plugins, etc.)
+        may also set the terminal window title. This could result in whatever value you write
+        using this method being overwritten.
+
+        Args:
+            title (str): The new title of the terminal window.
+
+        Returns:
+            bool: True if the control code to change the terminal title was
+                written, otherwise False. Note that a return value of True
+                does not guarantee that the window title has actually changed,
+                since the feature may be unsupported/disabled in some terminals.
+        """
+        if self.is_terminal:
+            self.control(Control.title(title))
+            return True
+        return False
 
     def screen(
         self, hide_cursor: bool = True, style: Optional[StyleType] = None
@@ -1198,10 +1300,10 @@ class Console:
             # No space to render anything. This prevents potential recursion errors.
             return
         render_iterable: RenderResult
-        if hasattr(renderable, "__rich__") and not isclass(renderable):
-            renderable = renderable.__rich__()  # type: ignore
+
+        renderable = rich_cast(renderable)
         if hasattr(renderable, "__rich_console__") and not isclass(renderable):
-            render_iterable = renderable.__rich_console__(self, _options)  # type: ignore
+            render_iterable = renderable.__rich_console__(self, _options)
         elif isinstance(renderable, str):
             text_renderable = self.render_str(
                 renderable, highlight=_options.highlight, markup=_options.markup
@@ -1220,6 +1322,7 @@ class Console:
                 f"object {render_iterable!r} is not renderable"
             )
         _Segment = Segment
+        _options = _options.reset_height()
         for render_output in iter_render:
             if isinstance(render_output, _Segment):
                 yield render_output
@@ -1255,6 +1358,11 @@ class Console:
             _rendered = self.render(renderable, render_options)
             if style:
                 _rendered = Segment.apply_style(_rendered, style)
+
+            render_height = render_options.height
+            if render_height is not None:
+                render_height = max(0, render_height)
+
             lines = list(
                 islice(
                     Segment.split_and_crop_lines(
@@ -1262,18 +1370,24 @@ class Console:
                         render_options.max_width,
                         include_new_lines=new_lines,
                         pad=pad,
+                        style=style,
                     ),
                     None,
-                    render_options.height,
+                    render_height,
                 )
             )
             if render_options.height is not None:
                 extra_lines = render_options.height - len(lines)
                 if extra_lines > 0:
                     pad_line = [
-                        [Segment(" " * render_options.max_width, style), Segment("\n")]
-                        if new_lines
-                        else [Segment(" " * render_options.max_width, style)]
+                        (
+                            [
+                                Segment(" " * render_options.max_width, style),
+                                Segment("\n"),
+                            ]
+                            if new_lines
+                            else [Segment(" " * render_options.max_width, style)]
+                        )
                     ]
                     lines.extend(pad_line * extra_lines)
 
@@ -1291,7 +1405,7 @@ class Console:
         highlight: Optional[bool] = None,
         highlighter: Optional[HighlighterType] = None,
     ) -> "Text":
-        """Convert a string to a Text instance. This is is called automatically if
+        """Convert a string to a Text instance. This is called automatically if
         you print or log a string.
 
         Args:
@@ -1322,9 +1436,11 @@ class Console:
             rich_text.overflow = overflow
         else:
             rich_text = Text(
-                _emoji_replace(text, default_variant=self._emoji_variant)
-                if emoji_enabled
-                else text,
+                (
+                    _emoji_replace(text, default_variant=self._emoji_variant)
+                    if emoji_enabled
+                    else text
+                ),
                 justify=justify,
                 overflow=overflow,
                 style=style,
@@ -1341,7 +1457,7 @@ class Console:
     def get_style(
         self, name: Union[str, Style], *, default: Optional[Union[Style, str]] = None
     ) -> Style:
-        """Get a Style instance by it's theme name or parse a definition.
+        """Get a Style instance by its theme name or parse a definition.
 
         Args:
             name (str): The name of a style or a style definition.
@@ -1414,24 +1530,22 @@ class Console:
             if text:
                 sep_text = Text(sep, justify=justify, end=end)
                 append(sep_text.join(text))
-                del text[:]
+                text.clear()
 
         for renderable in objects:
-            # I promise this is sane
-            # This detects an object which claims to have all attributes, such as MagicMock.mock_calls
-            if hasattr(
-                renderable, "jwevpw_eors4dfo6mwo345ermk7kdnfnwerwer"
-            ):  # pragma: no cover
-                renderable = repr(renderable)
-            rich_cast = getattr(renderable, "__rich__", None)
-            if rich_cast:
-                renderable = rich_cast()
+            renderable = rich_cast(renderable)
             if isinstance(renderable, str):
                 append_text(
                     self.render_str(
-                        renderable, emoji=emoji, markup=markup, highlighter=_highlighter
+                        renderable,
+                        emoji=emoji,
+                        markup=markup,
+                        highlight=highlight,
+                        highlighter=_highlighter,
                     )
                 )
+            elif isinstance(renderable, Text):
+                append_text(renderable)
             elif isinstance(renderable, ConsoleRenderable):
                 check_text()
                 append(renderable)
@@ -1477,9 +1591,8 @@ class Console:
             control_codes (str): Control codes, such as those that may move the cursor.
         """
         if not self.is_dumb_terminal:
-            for _control in control:
-                self._buffer.append(_control.segment)
-            self._check_buffer()
+            with self:
+                self._buffer.extend(_control.segment for _control in control)
 
     def out(
         self,
@@ -1561,7 +1674,7 @@ class Console:
             if overflow is None:
                 overflow = "ignore"
             crop = False
-
+        render_hooks = self._render_hooks[:]
         with self:
             renderables = self._collect_renderables(
                 objects,
@@ -1572,7 +1685,7 @@ class Console:
                 markup=markup,
                 highlight=highlight,
             )
-            for hook in self._render_hooks:
+            for hook in render_hooks:
                 renderables = hook.process_renderables(renderables)
             render_options = self.options.update(
                 justify=justify,
@@ -1581,6 +1694,7 @@ class Console:
                 height=height,
                 no_wrap=no_wrap,
                 markup=markup,
+                highlight=highlight,
             )
 
             new_segments: List[Segment] = []
@@ -1610,6 +1724,67 @@ class Console:
                     buffer_extend(line)
             else:
                 self._buffer.extend(new_segments)
+
+    def print_json(
+        self,
+        json: Optional[str] = None,
+        *,
+        data: Any = None,
+        indent: Union[None, int, str] = 2,
+        highlight: bool = True,
+        skip_keys: bool = False,
+        ensure_ascii: bool = False,
+        check_circular: bool = True,
+        allow_nan: bool = True,
+        default: Optional[Callable[[Any], Any]] = None,
+        sort_keys: bool = False,
+    ) -> None:
+        """Pretty prints JSON. Output will be valid JSON.
+
+        Args:
+            json (Optional[str]): A string containing JSON.
+            data (Any): If json is not supplied, then encode this data.
+            indent (Union[None, int, str], optional): Number of spaces to indent. Defaults to 2.
+            highlight (bool, optional): Enable highlighting of output: Defaults to True.
+            skip_keys (bool, optional): Skip keys not of a basic type. Defaults to False.
+            ensure_ascii (bool, optional): Escape all non-ascii characters. Defaults to False.
+            check_circular (bool, optional): Check for circular references. Defaults to True.
+            allow_nan (bool, optional): Allow NaN and Infinity values. Defaults to True.
+            default (Callable, optional): A callable that converts values that can not be encoded
+                in to something that can be JSON encoded. Defaults to None.
+            sort_keys (bool, optional): Sort dictionary keys. Defaults to False.
+        """
+        from rich.json import JSON
+
+        if json is None:
+            json_renderable = JSON.from_data(
+                data,
+                indent=indent,
+                highlight=highlight,
+                skip_keys=skip_keys,
+                ensure_ascii=ensure_ascii,
+                check_circular=check_circular,
+                allow_nan=allow_nan,
+                default=default,
+                sort_keys=sort_keys,
+            )
+        else:
+            if not isinstance(json, str):
+                raise TypeError(
+                    f"json must be str. Did you mean print_json(data={json!r}) ?"
+                )
+            json_renderable = JSON(
+                json,
+                indent=indent,
+                highlight=highlight,
+                skip_keys=skip_keys,
+                ensure_ascii=ensure_ascii,
+                check_circular=check_circular,
+                allow_nan=allow_nan,
+                default=default,
+                sort_keys=sort_keys,
+            )
+        self.print(json_renderable, soft_wrap=True)
 
     def update_screen(
         self,
@@ -1673,15 +1848,19 @@ class Console:
         theme: Optional[str] = None,
         word_wrap: bool = False,
         show_locals: bool = False,
+        suppress: Iterable[Union[str, ModuleType]] = (),
+        max_frames: int = 100,
     ) -> None:
         """Prints a rich render of the last exception and traceback.
 
         Args:
-            width (Optional[int], optional): Number of characters used to render code. Defaults to 88.
+            width (Optional[int], optional): Number of characters used to render code. Defaults to 100.
             extra_lines (int, optional): Additional lines of code to render. Defaults to 3.
             theme (str, optional): Override pygments theme used in traceback
             word_wrap (bool, optional): Enable word wrapping of long lines. Defaults to False.
             show_locals (bool, optional): Enable display of local variables. Defaults to False.
+            suppress (Iterable[Union[str, ModuleType]]): Optional sequence of modules or paths to exclude from traceback.
+            max_frames (int): Maximum number of frames to show in a traceback, 0 for no maximum. Defaults to 100.
         """
         from .traceback import Traceback
 
@@ -1691,6 +1870,8 @@ class Console:
             theme=theme,
             word_wrap=word_wrap,
             show_locals=show_locals,
+            suppress=suppress,
+            max_frames=max_frames,
         )
         self.print(traceback)
 
@@ -1719,7 +1900,7 @@ class Console:
         frame = currentframe()
         if frame is not None:
             # Use the faster currentframe where implemented
-            while offset and frame:
+            while offset and frame is not None:
                 frame = frame.f_back
                 offset -= 1
             assert frame is not None
@@ -1750,7 +1931,6 @@ class Console:
             end (str, optional): String to write at end of print data. Defaults to "\\\\n".
             style (Union[str, Style], optional): A style to apply to output. Defaults to None.
             justify (str, optional): One of "left", "right", "center", or "full". Defaults to ``None``.
-            overflow (str, optional): Overflow method: "crop", "fold", or "ellipsis". Defaults to None.
             emoji (Optional[bool], optional): Enable emoji code, or ``None`` to use console default. Defaults to None.
             markup (Optional[bool], optional): Enable markup, or ``None`` to use console default. Defaults to None.
             highlight (Optional[bool], optional): Enable automatic highlighting, or ``None`` to use console default. Defaults to None.
@@ -1760,6 +1940,8 @@ class Console:
         """
         if not objects:
             objects = (NewLine(),)
+
+        render_hooks = self._render_hooks[:]
 
         with self:
             renderables = self._collect_renderables(
@@ -1795,7 +1977,7 @@ class Console:
                     link_path=link_path,
                 )
             ]
-            for hook in self._render_hooks:
+            for hook in render_hooks:
                 renderables = hook.process_renderables(renderables)
             new_segments: List[Segment] = []
             extend = new_segments.extend
@@ -1809,12 +1991,43 @@ class Console:
             ):
                 buffer_extend(line)
 
+    def on_broken_pipe(self) -> None:
+        """This function is called when a `BrokenPipeError` is raised.
+
+        This can occur when piping Textual output in Linux and macOS.
+        The default implementation is to exit the app, but you could implement
+        this method in a subclass to change the behavior.
+
+        See https://docs.python.org/3/library/signal.html#note-on-sigpipe for details.
+        """
+        self.quiet = True
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        raise SystemExit(1)
+
     def _check_buffer(self) -> None:
-        """Check if the buffer may be rendered."""
+        """Check if the buffer may be rendered. Render it if it can (e.g. Console.quiet is False)
+        Rendering is supported on Windows, Unix and Jupyter environments. For
+        legacy Windows consoles, the win32 API is called directly.
+        This method will also record what it renders if recording is enabled via Console.record.
+        """
         if self.quiet:
             del self._buffer[:]
             return
+
+        try:
+            self._write_buffer()
+        except BrokenPipeError:
+            self.on_broken_pipe()
+
+    def _write_buffer(self) -> None:
+        """Write the buffer to the output file."""
+
         with self._lock:
+            if self.record and not self._buffer_index:
+                with self._record_buffer_lock:
+                    self._record_buffer.extend(self._buffer[:])
+
             if self._buffer_index == 0:
                 if self.is_jupyter:  # pragma: no cover
                     from .jupyter import display
@@ -1822,21 +2035,63 @@ class Console:
                     display(self._buffer, self._render_buffer(self._buffer[:]))
                     del self._buffer[:]
                 else:
-                    text = self._render_buffer(self._buffer[:])
-                    del self._buffer[:]
-                    if text:
+                    if WINDOWS:
+                        use_legacy_windows_render = False
+                        if self.legacy_windows:
+                            fileno = get_fileno(self.file)
+                            if fileno is not None:
+                                use_legacy_windows_render = (
+                                    fileno in _STD_STREAMS_OUTPUT
+                                )
+
+                        if use_legacy_windows_render:
+                            from rich._win32_console import LegacyWindowsTerm
+                            from rich._windows_renderer import legacy_windows_render
+
+                            buffer = self._buffer[:]
+                            if self.no_color and self._color_system:
+                                buffer = list(Segment.remove_color(buffer))
+
+                            legacy_windows_render(buffer, LegacyWindowsTerm(self.file))
+                        else:
+                            # Either a non-std stream on legacy Windows, or modern Windows.
+                            text = self._render_buffer(self._buffer[:])
+                            # https://bugs.python.org/issue37871
+                            # https://github.com/python/cpython/issues/82052
+                            # We need to avoid writing more than 32Kb in a single write, due to the above bug
+                            write = self.file.write
+                            # Worse case scenario, every character is 4 bytes of utf-8
+                            MAX_WRITE = 32 * 1024 // 4
+                            try:
+                                if len(text) <= MAX_WRITE:
+                                    write(text)
+                                else:
+                                    batch: List[str] = []
+                                    batch_append = batch.append
+                                    size = 0
+                                    for line in text.splitlines(True):
+                                        if size + len(line) > MAX_WRITE and batch:
+                                            write("".join(batch))
+                                            batch.clear()
+                                            size = 0
+                                        batch_append(line)
+                                        size += len(line)
+                                    if batch:
+                                        write("".join(batch))
+                                        batch.clear()
+                            except UnicodeEncodeError as error:
+                                error.reason = f"{error.reason}\n*** You may need to add PYTHONIOENCODING=utf-8 to your environment ***"
+                                raise
+                    else:
+                        text = self._render_buffer(self._buffer[:])
                         try:
-                            if WINDOWS:  # pragma: no cover
-                                # https://bugs.python.org/issue37871
-                                write = self.file.write
-                                for line in text.splitlines(True):
-                                    write(line)
-                            else:
-                                self.file.write(text)
-                            self.file.flush()
+                            self.file.write(text)
                         except UnicodeEncodeError as error:
                             error.reason = f"{error.reason}\n*** You may need to add PYTHONIOENCODING=utf-8 to your environment ***"
                             raise
+
+                    self.file.flush()
+                    del self._buffer[:]
 
     def _render_buffer(self, buffer: Iterable[Segment]) -> str:
         """Render buffered output, and clear buffer."""
@@ -1844,9 +2099,6 @@ class Console:
         append = output.append
         color_system = self._color_system
         legacy_windows = self.legacy_windows
-        if self.record:
-            with self._record_buffer_lock:
-                self._record_buffer.extend(buffer)
         not_terminal = not self.is_terminal
         if self.no_color and color_system:
             buffer = Segment.remove_color(buffer)
@@ -1876,6 +2128,8 @@ class Console:
     ) -> str:
         """Displays a prompt and waits for input from the user. The prompt may contain color / style.
 
+        It works in the same way as Python's builtin :func:`input` function and provides elaborate line editing and history features if Python's builtin :mod:`readline` module is previously loaded.
+
         Args:
             prompt (Union[str, Text]): Text to render in the prompt.
             markup (bool, optional): Enable console markup (requires a str prompt). Defaults to True.
@@ -1886,23 +2140,15 @@ class Console:
         Returns:
             str: Text read from stdin.
         """
-        prompt_str = ""
         if prompt:
-            with self.capture() as capture:
-                self.print(prompt, markup=markup, emoji=emoji, end="")
-            prompt_str = capture.get()
-        if self.legacy_windows:
-            # Legacy windows doesn't like ANSI codes in getpass or input (colorama bug)?
-            self.file.write(prompt_str)
-            prompt_str = ""
+            self.print(prompt, markup=markup, emoji=emoji, end="")
         if password:
-            result = getpass(prompt_str, stream=stream)
+            result = getpass("", stream=stream)
         else:
             if stream:
-                self.file.write(prompt_str)
                 result = stream.readline()
             else:
-                result = input(prompt_str)
+                result = input()
         return result
 
     def export_text(self, *, clear: bool = True, styles: bool = False) -> str:
@@ -1948,7 +2194,7 @@ class Console:
 
         """
         text = self.export_text(clear=clear, styles=styles)
-        with open(path, "wt", encoding="utf-8") as write_file:
+        with open(path, "w", encoding="utf-8") as write_file:
             write_file.write(text)
 
     def export_html(
@@ -1964,8 +2210,8 @@ class Console:
         Args:
             theme (TerminalTheme, optional): TerminalTheme object containing console colors.
             clear (bool, optional): Clear record buffer after exporting. Defaults to ``True``.
-            code_format (str, optional): Format string to render HTML, should contain {foreground}
-                {background} and {code}.
+            code_format (str, optional): Format string to render HTML. In addition to '{foreground}',
+                '{background}', and '{code}', should contain '{stylesheet}' if inline_styles is ``False``.
             inline_styles (bool, optional): If ``True`` styles will be inlined in to spans, which makes files
                 larger but easier to cut and paste markup. If ``False``, styles will be embedded in a style tag.
                 Defaults to False.
@@ -1980,10 +2226,6 @@ class Console:
         append = fragments.append
         _theme = theme or DEFAULT_TERMINAL_THEME
         stylesheet = ""
-
-        def escape(text: str) -> str:
-            """Escape html."""
-            return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
         render_code_format = CONSOLE_HTML_FORMAT if code_format is None else code_format
 
@@ -2045,8 +2287,8 @@ class Console:
             path (str): Path to write html file.
             theme (TerminalTheme, optional): TerminalTheme object containing console colors.
             clear (bool, optional): Clear record buffer after exporting. Defaults to ``True``.
-            code_format (str, optional): Format string to render HTML, should contain {foreground}
-                {background} and {code}.
+            code_format (str, optional): Format string to render HTML. In addition to '{foreground}',
+                '{background}', and '{code}', should contain '{stylesheet}' if inline_styles is ``False``.
             inline_styles (bool, optional): If ``True`` styles will be inlined in to spans, which makes files
                 larger but easier to cut and paste markup. If ``False``, styles will be embedded in a style tag.
                 Defaults to False.
@@ -2058,12 +2300,313 @@ class Console:
             code_format=code_format,
             inline_styles=inline_styles,
         )
-        with open(path, "wt", encoding="utf-8") as write_file:
+        with open(path, "w", encoding="utf-8") as write_file:
             write_file.write(html)
+
+    def export_svg(
+        self,
+        *,
+        title: str = "Rich",
+        theme: Optional[TerminalTheme] = None,
+        clear: bool = True,
+        code_format: str = CONSOLE_SVG_FORMAT,
+        font_aspect_ratio: float = 0.61,
+        unique_id: Optional[str] = None,
+    ) -> str:
+        """
+        Generate an SVG from the console contents (requires record=True in Console constructor).
+
+        Args:
+            title (str, optional): The title of the tab in the output image
+            theme (TerminalTheme, optional): The ``TerminalTheme`` object to use to style the terminal
+            clear (bool, optional): Clear record buffer after exporting. Defaults to ``True``
+            code_format (str, optional): Format string used to generate the SVG. Rich will inject a number of variables
+                into the string in order to form the final SVG output. The default template used and the variables
+                injected by Rich can be found by inspecting the ``console.CONSOLE_SVG_FORMAT`` variable.
+            font_aspect_ratio (float, optional): The width to height ratio of the font used in the ``code_format``
+                string. Defaults to 0.61, which is the width to height ratio of Fira Code (the default font).
+                If you aren't specifying a different font inside ``code_format``, you probably don't need this.
+            unique_id (str, optional): unique id that is used as the prefix for various elements (CSS styles, node
+                ids). If not set, this defaults to a computed value based on the recorded content.
+        """
+
+        from rich.cells import cell_len
+
+        style_cache: Dict[Style, str] = {}
+
+        def get_svg_style(style: Style) -> str:
+            """Convert a Style to CSS rules for SVG."""
+            if style in style_cache:
+                return style_cache[style]
+            css_rules = []
+            color = (
+                _theme.foreground_color
+                if (style.color is None or style.color.is_default)
+                else style.color.get_truecolor(_theme)
+            )
+            bgcolor = (
+                _theme.background_color
+                if (style.bgcolor is None or style.bgcolor.is_default)
+                else style.bgcolor.get_truecolor(_theme)
+            )
+            if style.reverse:
+                color, bgcolor = bgcolor, color
+            if style.dim:
+                color = blend_rgb(color, bgcolor, 0.4)
+            css_rules.append(f"fill: {color.hex}")
+            if style.bold:
+                css_rules.append("font-weight: bold")
+            if style.italic:
+                css_rules.append("font-style: italic;")
+            if style.underline:
+                css_rules.append("text-decoration: underline;")
+            if style.strike:
+                css_rules.append("text-decoration: line-through;")
+
+            css = ";".join(css_rules)
+            style_cache[style] = css
+            return css
+
+        _theme = theme or SVG_EXPORT_THEME
+
+        width = self.width
+        char_height = 20
+        char_width = char_height * font_aspect_ratio
+        line_height = char_height * 1.22
+
+        margin_top = 1
+        margin_right = 1
+        margin_bottom = 1
+        margin_left = 1
+
+        padding_top = 40
+        padding_right = 8
+        padding_bottom = 8
+        padding_left = 8
+
+        padding_width = padding_left + padding_right
+        padding_height = padding_top + padding_bottom
+        margin_width = margin_left + margin_right
+        margin_height = margin_top + margin_bottom
+
+        text_backgrounds: List[str] = []
+        text_group: List[str] = []
+        classes: Dict[str, int] = {}
+        style_no = 1
+
+        def escape_text(text: str) -> str:
+            """HTML escape text and replace spaces with nbsp."""
+            return escape(text).replace(" ", "&#160;")
+
+        def make_tag(
+            name: str, content: Optional[str] = None, **attribs: object
+        ) -> str:
+            """Make a tag from name, content, and attributes."""
+
+            def stringify(value: object) -> str:
+                if isinstance(value, (float)):
+                    return format(value, "g")
+                return str(value)
+
+            tag_attribs = " ".join(
+                f'{k.lstrip("_").replace("_", "-")}="{stringify(v)}"'
+                for k, v in attribs.items()
+            )
+            return (
+                f"<{name} {tag_attribs}>{content}</{name}>"
+                if content
+                else f"<{name} {tag_attribs}/>"
+            )
+
+        with self._record_buffer_lock:
+            segments = list(Segment.filter_control(self._record_buffer))
+            if clear:
+                self._record_buffer.clear()
+
+        if unique_id is None:
+            unique_id = "terminal-" + str(
+                zlib.adler32(
+                    ("".join(repr(segment) for segment in segments)).encode(
+                        "utf-8",
+                        "ignore",
+                    )
+                    + title.encode("utf-8", "ignore")
+                )
+            )
+        y = 0
+        for y, line in enumerate(Segment.split_and_crop_lines(segments, length=width)):
+            x = 0
+            for text, style, _control in line:
+                style = style or Style()
+                rules = get_svg_style(style)
+                if rules not in classes:
+                    classes[rules] = style_no
+                    style_no += 1
+                class_name = f"r{classes[rules]}"
+
+                if style.reverse:
+                    has_background = True
+                    background = (
+                        _theme.foreground_color.hex
+                        if style.color is None
+                        else style.color.get_truecolor(_theme).hex
+                    )
+                else:
+                    bgcolor = style.bgcolor
+                    has_background = bgcolor is not None and not bgcolor.is_default
+                    background = (
+                        _theme.background_color.hex
+                        if style.bgcolor is None
+                        else style.bgcolor.get_truecolor(_theme).hex
+                    )
+
+                text_length = cell_len(text)
+                if has_background:
+                    text_backgrounds.append(
+                        make_tag(
+                            "rect",
+                            fill=background,
+                            x=x * char_width,
+                            y=y * line_height + 1.5,
+                            width=char_width * text_length,
+                            height=line_height + 0.25,
+                            shape_rendering="crispEdges",
+                        )
+                    )
+
+                if text != " " * len(text):
+                    text_group.append(
+                        make_tag(
+                            "text",
+                            escape_text(text),
+                            _class=f"{unique_id}-{class_name}",
+                            x=x * char_width,
+                            y=y * line_height + char_height,
+                            textLength=char_width * len(text),
+                            clip_path=f"url(#{unique_id}-line-{y})",
+                        )
+                    )
+                x += cell_len(text)
+
+        line_offsets = [line_no * line_height + 1.5 for line_no in range(y)]
+        lines = "\n".join(
+            f"""<clipPath id="{unique_id}-line-{line_no}">
+    {make_tag("rect", x=0, y=offset, width=char_width * width, height=line_height + 0.25)}
+            </clipPath>"""
+            for line_no, offset in enumerate(line_offsets)
+        )
+
+        styles = "\n".join(
+            f".{unique_id}-r{rule_no} {{ {css} }}" for css, rule_no in classes.items()
+        )
+        backgrounds = "".join(text_backgrounds)
+        matrix = "".join(text_group)
+
+        terminal_width = ceil(width * char_width + padding_width)
+        terminal_height = (y + 1) * line_height + padding_height
+        chrome = make_tag(
+            "rect",
+            fill=_theme.background_color.hex,
+            stroke="rgba(255,255,255,0.35)",
+            stroke_width="1",
+            x=margin_left,
+            y=margin_top,
+            width=terminal_width,
+            height=terminal_height,
+            rx=8,
+        )
+
+        title_color = _theme.foreground_color.hex
+        if title:
+            chrome += make_tag(
+                "text",
+                escape_text(title),
+                _class=f"{unique_id}-title",
+                fill=title_color,
+                text_anchor="middle",
+                x=terminal_width // 2,
+                y=margin_top + char_height + 6,
+            )
+        chrome += f"""
+            <g transform="translate(26,22)">
+            <circle cx="0" cy="0" r="7" fill="#ff5f57"/>
+            <circle cx="22" cy="0" r="7" fill="#febc2e"/>
+            <circle cx="44" cy="0" r="7" fill="#28c840"/>
+            </g>
+        """
+
+        svg = code_format.format(
+            unique_id=unique_id,
+            char_width=char_width,
+            char_height=char_height,
+            line_height=line_height,
+            terminal_width=char_width * width - 1,
+            terminal_height=(y + 1) * line_height - 1,
+            width=terminal_width + margin_width,
+            height=terminal_height + margin_height,
+            terminal_x=margin_left + padding_left,
+            terminal_y=margin_top + padding_top,
+            styles=styles,
+            chrome=chrome,
+            backgrounds=backgrounds,
+            matrix=matrix,
+            lines=lines,
+        )
+        return svg
+
+    def save_svg(
+        self,
+        path: str,
+        *,
+        title: str = "Rich",
+        theme: Optional[TerminalTheme] = None,
+        clear: bool = True,
+        code_format: str = CONSOLE_SVG_FORMAT,
+        font_aspect_ratio: float = 0.61,
+        unique_id: Optional[str] = None,
+    ) -> None:
+        """Generate an SVG file from the console contents (requires record=True in Console constructor).
+
+        Args:
+            path (str): The path to write the SVG to.
+            title (str, optional): The title of the tab in the output image
+            theme (TerminalTheme, optional): The ``TerminalTheme`` object to use to style the terminal
+            clear (bool, optional): Clear record buffer after exporting. Defaults to ``True``
+            code_format (str, optional): Format string used to generate the SVG. Rich will inject a number of variables
+                into the string in order to form the final SVG output. The default template used and the variables
+                injected by Rich can be found by inspecting the ``console.CONSOLE_SVG_FORMAT`` variable.
+            font_aspect_ratio (float, optional): The width to height ratio of the font used in the ``code_format``
+                string. Defaults to 0.61, which is the width to height ratio of Fira Code (the default font).
+                If you aren't specifying a different font inside ``code_format``, you probably don't need this.
+            unique_id (str, optional): unique id that is used as the prefix for various elements (CSS styles, node
+                ids). If not set, this defaults to a computed value based on the recorded content.
+        """
+        svg = self.export_svg(
+            title=title,
+            theme=theme,
+            clear=clear,
+            code_format=code_format,
+            font_aspect_ratio=font_aspect_ratio,
+            unique_id=unique_id,
+        )
+        with open(path, "w", encoding="utf-8") as write_file:
+            write_file.write(svg)
+
+
+def _svg_hash(svg_main_code: str) -> str:
+    """Returns a unique hash for the given SVG main code.
+
+    Args:
+        svg_main_code (str): The content we're going to inject in the SVG envelope.
+
+    Returns:
+        str: a hash of the given content
+    """
+    return str(zlib.adler32(svg_main_code.encode()))
 
 
 if __name__ == "__main__":  # pragma: no cover
-    console = Console()
+    console = Console(record=True)
 
     console.log(
         "JSONRPC [i]request[/i]",
@@ -2116,4 +2659,3 @@ if __name__ == "__main__":  # pragma: no cover
             },
         }
     )
-    console.log("foo")

@@ -1,18 +1,10 @@
 import colorsys
 import io
 from time import process_time
-from typing import Any
 
 from rich import box
 from rich.color import Color
-from rich.console import (
-    Console,
-    ConsoleOptions,
-    ConsoleRenderable,
-    RenderGroup,
-    RenderResult,
-    RenderableType,
-)
+from rich.console import Console, ConsoleOptions, Group, RenderableType, RenderResult
 from rich.markdown import Markdown
 from rich.measure import Measurement
 from rich.pretty import Pretty
@@ -59,7 +51,6 @@ def make_test_card() -> Table:
         pad_edge=False,
     )
     color_table.add_row(
-        # "[bold yellow]256[/] colors or [bold green]16.7 million[/] colors [blue](if supported by your terminal)[/].",
         (
             "✓ [bold green]4-bit color[/]\n"
             "✓ [bold blue]8-bit color[/]\n"
@@ -88,7 +79,7 @@ def make_test_card() -> Table:
     )
     table.add_row(
         "Text",
-        RenderGroup(
+        Group(
             Text.from_markup(
                 """Word wrap text. Justify [green]left[/], [yellow]center[/], [blue]right[/] or [red]full[/].\n"""
             ),
@@ -109,7 +100,7 @@ def make_test_card() -> Table:
     )
 
     markup_example = (
-        "[bold magenta]Rich[/] supports a simple [i]bbcode[/i] like [b]markup[/b] for [yellow]color[/], [underline]style[/], and emoji! "
+        "[bold magenta]Rich[/] supports a simple [i]bbcode[/i]-like [b]markup[/b] for [yellow]color[/], [underline]style[/], and emoji! "
         ":+1: :apple: :ant: :bear: :baguette_bread: :bus: "
     )
     table.add_row("Markup", markup_example)
@@ -197,7 +188,7 @@ def iter_last(values: Iterable[T]) -> Iterable[Tuple[bool, T]]:
     markdown_example = """\
 # Markdown
 
-Supports much of the *markdown*, __syntax__!
+Supports much of the *markdown* __syntax__!
 
 - Headers
 - Basic formatting: **bold**, *italic*, `code`
@@ -216,7 +207,6 @@ Supports much of the *markdown*, __syntax__!
 
 
 if __name__ == "__main__":  # pragma: no cover
-
     console = Console(
         file=io.StringIO(),
         force_terminal=True,
@@ -224,19 +214,21 @@ if __name__ == "__main__":  # pragma: no cover
     test_card = make_test_card()
 
     # Print once to warm cache
+    start = process_time()
     console.print(test_card)
+    pre_cache_taken = round((process_time() - start) * 1000.0, 1)
+
     console.file = io.StringIO()
 
     start = process_time()
     console.print(test_card)
     taken = round((process_time() - start) * 1000.0, 1)
 
-    text = console.file.getvalue()
-    # https://bugs.python.org/issue37871
-    for line in text.splitlines():
-        print(line)
+    c = Console(record=True)
+    c.print(test_card)
 
-    print(f"rendered in {taken}ms")
+    print(f"rendered in {pre_cache_taken}ms (cold cache)")
+    print(f"rendered in {taken}ms (warm cache)")
 
     from rich.panel import Panel
 
@@ -245,27 +237,21 @@ if __name__ == "__main__":  # pragma: no cover
     sponsor_message = Table.grid(padding=1)
     sponsor_message.add_column(style="green", justify="right")
     sponsor_message.add_column(no_wrap=True)
+
     sponsor_message.add_row(
-        "Sponsor me",
-        "[u blue link=https://github.com/sponsors/willmcgugan]https://github.com/sponsors/willmcgugan",
-    )
-    sponsor_message.add_row(
-        "Buy me a :coffee:",
-        "[u blue link=https://ko-fi.com/willmcgugan]https://ko-fi.com/willmcgugan",
+        "Textualize",
+        "[u blue link=https://github.com/textualize]https://github.com/textualize",
     )
     sponsor_message.add_row(
         "Twitter",
         "[u blue link=https://twitter.com/willmcgugan]https://twitter.com/willmcgugan",
     )
-    sponsor_message.add_row(
-        "Blog", "[u blue link=https://www.willmcgugan.com]https://www.willmcgugan.com"
-    )
 
     intro_message = Text.from_markup(
         """\
-It takes a lot of time to develop Rich and to provide support.
+We hope you enjoy using Rich!
 
-Consider supporting my work via Github Sponsors (ask your company / organization), or buy me a coffee to say thanks.
+Rich is maintained with [red]:heart:[/] by [link=https://www.textualize.io]Textualize.io[/]
 
 - Will McGugan"""
     )

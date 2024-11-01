@@ -6,7 +6,6 @@ from rich import box
 from rich.align import Align
 from rich.console import Console
 from rich.live import Live
-from rich.measure import Measurement
 from rich.table import Table
 from rich.text import Text
 
@@ -163,14 +162,14 @@ with Live(table_centered, console=console, screen=False, refresh_per_second=20):
     with beat(10):
         table.border_style = "bright_yellow"
 
-    for box in [
+    for box_style in [
         box.SQUARE,
         box.MINIMAL,
         box.SIMPLE,
         box.SIMPLE_HEAD,
     ]:
         with beat(10):
-            table.box = box
+            table.box = box_style
 
     with beat(10):
         table.pad_edge = False
